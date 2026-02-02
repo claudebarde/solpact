@@ -4,9 +4,15 @@ use solang_parser::{
     parse,
     pt::{ContractPart, Expression, SourceUnitPart, Statement},
 };
+use std::collections::HashMap;
 use std::{env, fs, path::Path};
 use toml;
 mod compact;
+use compact::CompactType;
+
+const WITNESSES_CONTRACT: &str = "Witnesses";
+
+type Scope = HashMap<String, CompactType>;
 
 #[derive(Debug, Deserialize)]
 struct SolpactConfig {
@@ -37,11 +43,19 @@ impl Formatter {
         self.indent = self.indent.saturating_sub(1);
     }
 
-    fn line(&mut self, s: &str) {
+    fn line(&mut self, (s, do_not_print): (String, bool)) {
+        // reinitialize output line
+        self.out = String::new();
+
+        if do_not_print {
+            return;
+        }
+
         for _ in 0..self.indent {
             self.out.push_str("    ");
         }
-        self.out.push_str(s);
+        self.out.push_str(&s);
+        self.out.push_str(";");
         self.out.push('\n');
     }
 
@@ -59,6 +73,104 @@ fn read_project_config() -> Option<SolpactConfig> {
 
     let content = fs::read_to_string(path).ok()?;
     toml::from_str(&content).ok()
+}
+
+struct FuncSignature {
+    name: String,
+    is_exported: bool,
+    params: Vec<String>,
+    return_type: String,
+}
+fn parse_func_signature(
+    func_def: &solang_parser::pt::FunctionDefinition,
+    scope: &mut Scope,
+) -> FuncSignature {
+    let func_name = match &func_def.name {
+        Some(name) => name.name.clone(),
+        None if &func_def.ty == &solang_parser::pt::FunctionTy::Constructor => {
+            "constructor".to_string()
+        }
+        None => panic!("FunctionDefinition without a name found: {:#?}", func_def),
+    };
+    // looks for visibility attributes in attrs vector to define if the function is exported
+    let mut is_exported = false;
+    for attr in &func_def.attributes {
+        match attr {
+            solang_parser::pt::FunctionAttribute::Visibility(vis) => {
+                if vis.as_str() == "public" {
+                    is_exported = true;
+                }
+            }
+            _ => (),
+        }
+    }
+    // function params
+    let mut params: Vec<String> = Vec::new();
+    if !&func_def.params.is_empty() {
+        for param in &func_def.params {
+            match &param.1 {
+                None => panic!("Unnamed parameter found!"),
+                Some(param) => match &param.ty {
+                    solang_parser::pt::Expression::Type(_, param_type) => {
+                        let sol_type = param_type.to_string();
+                        match compact::sol_to_compact_type(&sol_type) {
+                            Some(compact_type) => match &param.name {
+                                None => {
+                                    panic!("Parameter of type '{}' is missing a name!", sol_type)
+                                }
+                                Some(param_name) => {
+                                    scope.insert(
+                                        param_name.to_string(),
+                                        CompactType::from_string(&compact_type).unwrap(),
+                                    );
+                                    params.push(format!("{}: {}", param_name, compact_type))
+                                }
+                            },
+                            None => {
+                                panic!("Unsupported parameter type '{}' found!", sol_type)
+                            }
+                        }
+                    }
+                    _ => panic!("Unsupported parameter type expression!"),
+                },
+            }
+        }
+    }
+    // function return type
+    let return_type = if func_def.returns.is_empty() {
+        "[]".to_string()
+    } else {
+        // maps over the return types and collects their string representations in a tuple for Compact
+        let types: Vec<String> = func_def
+            .returns
+            .iter()
+            .map(|ret| match &ret.1 {
+                None => todo!("Handle unnamed return types"),
+                Some(param) => match &param.ty {
+                    solang_parser::pt::Expression::Type(_, ret_type) => {
+                        let sol_type = ret_type.to_string();
+                        match compact::sol_to_compact_type(&sol_type) {
+                            Some(compact_type) => compact_type,
+                            None => panic!("Unsupported return type '{}' found!", sol_type),
+                        }
+                    }
+                    _ => panic!("Unsupported return type expression!"),
+                },
+            })
+            .collect();
+        if types.len() == 1 {
+            types[0].clone()
+        } else {
+            format!("[{}]", types.join(", "))
+        }
+    };
+
+    return FuncSignature {
+        name: func_name,
+        is_exported,
+        params,
+        return_type,
+    };
 }
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -125,17 +237,46 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
     }
 
+    let mut formatter = Formatter::new();
+
     // visits the AST and generates Compact code
     let mut top_level = true;
+    let mut global_scope = Scope::new();
     for part in &ast.0 {
         match part {
             SourceUnitPart::ContractDefinition(def) => {
-                println!("found contract {:?}", def.name);
-                // import Compact standard library
-                compact_output.push(String::from("import CompactStandardLibrary;\n"));
-                // visit each part of the contract
-                for part in &def.parts {
-                    visit(part, top_level, &mut compact_output);
+                match &def.name {
+                    Some(def_name) => {
+                        if def_name.to_string() == WITNESSES_CONTRACT {
+                            if def.parts.is_empty() {
+                                compact_output
+                                    .push(String::from("// No witness found in the contract\n"));
+                                break;
+                            }
+                            for part in &def.parts {
+                                // only the function definitions are relevant here
+                                match part {
+                                    ContractPart::FunctionDefinition(func_def) => {
+                                        let func_signature =
+                                            parse_func_signature(func_def, &mut global_scope);
+                                        compact_output.push(format!(
+                                            "witness {}(): {};\n",
+                                            func_signature.name, func_signature.return_type
+                                        ));
+                                    }
+                                    _ => (),
+                                }
+                            }
+                        } else {
+                            // import Compact standard library
+                            compact_output.push(String::from("import CompactStandardLibrary;\n"));
+                            // visit each part of the contract
+                            for part in &def.parts {
+                                visit(part, top_level, &mut compact_output, &mut formatter);
+                            }
+                        }
+                    }
+                    _ => (),
                 }
             }
             _ => (),
@@ -159,9 +300,13 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 
-fn visit(part: &ContractPart, top_level: bool, compact_output: &mut Vec<String>) {
+fn visit(
+    part: &ContractPart,
+    top_level: bool,
+    compact_output: &mut Vec<String>,
+    formatter: &mut Formatter,
+) {
     println!("Visiting contract part: {:#?}", part);
-    let mut formatter = Formatter::new();
 
     match part {
         ContractPart::VariableDefinition(var_def) => {
@@ -169,8 +314,37 @@ fn visit(part: &ContractPart, top_level: bool, compact_output: &mut Vec<String>)
                 None => panic!("VariableDefinition without a name found!"),
                 Some(var_name) => {
                     let var_type = match &var_def.ty {
-                        solang_parser::pt::Expression::Variable(id) => id.name.clone(),
-                        _ => panic!("Unsupported variable type expression!"),
+                        Expression::MemberAccess(_, expr, id) => {
+                            match compact::format_sol_to_compact_type(vec![
+                                expr.to_string(),
+                                id.name.clone(),
+                            ]) {
+                                Some(compact_type) => compact_type,
+                                None => panic!(
+                                    "Unsupported variable type '{}.{}' found!",
+                                    expr.to_string(),
+                                    id.name
+                                ),
+                            }
+                        }
+                        Expression::Variable(id) => {
+                            if id.name == WITNESSES_CONTRACT {
+                                // Witness type declaration are only for Solidity compatibility
+                                String::new()
+                            } else {
+                                id.name.clone()
+                            }
+                        }
+                        Expression::Type(_, sol_type) => {
+                            let sol_type_str = sol_type.to_string();
+                            match compact::sol_to_compact_type(&sol_type_str) {
+                                Some(compact_type) => compact_type,
+                                None => {
+                                    panic!("Unsupported variable type '{}' found!", sol_type_str)
+                                }
+                            }
+                        }
+                        _ => panic!("Unsupported variable type expression: {:#?}", var_def.ty),
                     };
                     // looks for visibility attributes in attrs vector to define if the variable is exported
                     let mut is_exported = false;
@@ -184,119 +358,76 @@ fn visit(part: &ContractPart, top_level: bool, compact_output: &mut Vec<String>)
                             _ => (),
                         }
                     }
-                    // if at top level, the variable is a ledger variable
-                    if top_level {
-                        compact_output.push(format!(
-                            "{}ledger {}: {};\n",
-                            if is_exported { "export " } else { "" },
-                            var_name,
-                            var_type
-                        ));
-                    } else {
-                        compact_output.push(format!("let {}: {};\n", var_name, var_type));
+                    if !var_type.is_empty() {
+                        // if at top level, the variable is a ledger variable
+                        if top_level {
+                            compact_output.push(format!(
+                                "{}ledger {}: {};",
+                                if is_exported { "export " } else { "" },
+                                var_name,
+                                var_type
+                            ));
+                        } else {
+                            compact_output.push(format!("let {}: {};\n", var_name, var_type));
+                        }
                     }
                 }
             }
         }
         ContractPart::FunctionDefinition(func_def) => {
-            let func_name = match &func_def.name {
-                Some(name) => name.name.clone(),
-                None => panic!("FunctionDefinition without a name found!"),
-            };
-            // looks for visibility attributes in attrs vector to define if the function is exported
-            let mut is_exported = false;
-            for attr in &func_def.attributes {
-                match attr {
-                    solang_parser::pt::FunctionAttribute::Visibility(vis) => {
-                        if vis.as_str() == "public" {
-                            is_exported = true;
-                        }
-                    }
-                    _ => (),
-                }
-            }
-            // function params
-            let mut params: Vec<String> = Vec::new();
-            if !&func_def.params.is_empty() {
-                for param in &func_def.params {
-                    match &param.1 {
-                        None => panic!("Unnamed parameter found!"),
-                        Some(param) => match &param.ty {
-                            solang_parser::pt::Expression::Type(_, param_type) => {
-                                let sol_type = param_type.to_string();
-                                match compact::sol_to_compact_type(&sol_type) {
-                                    Some(compact_type) => match &param.name {
-                                        None => {
-                                            panic!(
-                                                "Parameter of type '{}' is missing a name!",
-                                                sol_type
-                                            )
-                                        }
-                                        Some(param_name) => {
-                                            params.push(format!("{}: {}", param_name, compact_type))
-                                        }
-                                    },
-                                    None => {
-                                        panic!("Unsupported parameter type '{}' found!", sol_type)
-                                    }
-                                }
-                            }
-                            _ => panic!("Unsupported parameter type expression!"),
-                        },
-                    }
-                }
-            }
-            // function return type
-            let return_type = if func_def.returns.is_empty() {
-                "[]".to_string()
-            } else {
-                // maps over the return types and collects their string representations in a tuple for Compact
-                let types: Vec<String> = func_def
-                    .returns
-                    .iter()
-                    .map(|ret| match &ret.1 {
-                        None => todo!("Handle unnamed return types"),
-                        Some(param) => match &param.ty {
-                            solang_parser::pt::Expression::Type(_, ret_type) => {
-                                let sol_type = ret_type.to_string();
-                                match compact::sol_to_compact_type(&sol_type) {
-                                    Some(compact_type) => compact_type,
-                                    None => panic!("Unsupported return type '{}' found!", sol_type),
-                                }
-                            }
-                            _ => panic!("Unsupported return type expression!"),
-                        },
-                    })
-                    .collect();
-                if types.len() == 1 {
-                    types[0].clone()
-                } else {
-                    format!("[{}]", types.join(", "))
-                }
-            };
+            let mut scope = Scope::new();
+            let func_signature = parse_func_signature(func_def, &mut scope);
             // function body
             let func_body: String = match &func_def.body {
-                Some(body) => visit_statement(body, &mut formatter),
+                Some(body) => visit_statement(body, formatter, &mut scope),
                 None => String::from(""),
             };
             // function signature
-            let func_signature = format!(
-                "{}circuit {}({}): {} {{",
-                if is_exported { "export " } else { "" },
-                func_name,
-                params.join(", "),
-                return_type
-            );
+            let func_signature = if func_signature.name == "constructor" {
+                format!("\nconstructor({}) {{", func_signature.params.join(", "))
+            } else {
+                format!(
+                    "{}circuit {}({}): {} {{",
+                    if func_signature.is_exported {
+                        "export "
+                    } else {
+                        ""
+                    },
+                    func_signature.name,
+                    func_signature.params.join(", "),
+                    func_signature.return_type
+                )
+            };
             compact_output.push(func_signature);
             // function body (TODO: transpile statements)
             compact_output.push(func_body);
             compact_output.push(String::from("}\n"));
+            formatter.dedent();
         }
-        _ => (),
+        ContractPart::EnumDefinition(enum_def) => match &enum_def.name {
+            None => panic!("EnumDefinition without a name found!"),
+            Some(enum_name) => {
+                let mut variants: Vec<String> = Vec::new();
+                for variant in &enum_def.values {
+                    match variant {
+                        None => panic!("Enum variant without a name found!"),
+                        Some(variant) => variants.push(variant.name.clone()),
+                    }
+                }
+                // enum definitions are exported by default
+                compact_output.push(format!(
+                    "export enum {} {{ {} }}\n",
+                    enum_name,
+                    variants.join(", ")
+                ));
+            }
+        },
+        ContractPart::Using(_) => (),
+        _ => panic!("Unsupported contract part found: {:#?}", part),
     }
 }
 
-fn visit_statement(part: &Statement, formatter: &mut Formatter) -> String {
+fn visit_statement(part: &Statement, formatter: &mut Formatter, scope: &mut Scope) -> String {
     match part {
         Statement::Block { statements, .. } => {
             // update the formatter
@@ -307,45 +438,168 @@ fn visit_statement(part: &Statement, formatter: &mut Formatter) -> String {
             } else {
                 return statements
                     .iter()
-                    .map(|stmt| visit_statement(stmt, formatter))
+                    .map(|stmt| visit_statement(stmt, formatter, scope))
                     .collect::<Vec<String>>()
-                    .join("\n")
+                    .join("")
                     .trim_end()
                     .to_string();
             }
         }
         Statement::Expression(_, expr) => {
-            let result = visit_expression(expr, formatter);
-            formatter.line(&format!("{};", result));
+            let result = visit_expression(expr, formatter, scope);
+            formatter.line(result);
             return formatter.print();
         }
-        _ => String::from(""),
+        Statement::Return(_, expr_opt) => {
+            if let Some(expr) = expr_opt {
+                let result = visit_expression(expr, formatter, scope);
+                formatter.line((format!("return {}", result.0), result.1));
+                return formatter.print();
+            } else {
+                formatter.line((String::from("return"), false));
+                return formatter.print();
+            }
+        }
+        _ => panic!("Unsupported statement found: {:#?}", part),
     }
 }
 
-fn visit_expression(expr: &Expression, formatter: &mut Formatter) -> String {
+fn visit_expression(
+    expr: &Expression,
+    formatter: &mut Formatter,
+    scope: &mut Scope,
+) -> (String, bool) {
     match expr {
-        Expression::Variable(id) => id.name.clone(),
+        Expression::ArrayLiteral(_, elements) => {
+            let element_strs: Vec<(String, bool)> = elements
+                .iter()
+                .map(|element| visit_expression(element, formatter, scope))
+                .collect();
+            return (
+                format!(
+                    "[{}]",
+                    element_strs
+                        .iter()
+                        .map(|(s, _)| s.clone())
+                        .collect::<Vec<String>>()
+                        .join(", ")
+                ),
+                element_strs.iter().any(|(_, b)| *b),
+            );
+        }
+        Expression::Assign(_, left_expr, right_expr) => {
+            let left = visit_expression(left_expr, formatter, scope);
+            let right = visit_expression(right_expr, formatter, scope);
+            return (format!("{} = {}", left.0, right.0), left.1 || right.1);
+        }
+        Expression::Equal(_, left_expr, right_expr) => {
+            let left = visit_expression(left_expr, formatter, scope);
+            let right = visit_expression(right_expr, formatter, scope);
+            return (format!("{} == {}", left.0, right.0), left.1 || right.1);
+        }
         Expression::FunctionCall(_, name, params) => {
             // parses the function name
-            let name = visit_expression(name, formatter);
+            let name = visit_expression(name, formatter, scope);
             // parses the function params
-            let param_strs: Vec<String> = params
+            let param_strs: Vec<(String, bool)> = params
                 .iter()
-                .map(|param| visit_expression(param, formatter))
+                .map(|param| visit_expression(param, formatter, scope))
                 .collect();
+
+            // pad function special handling
+            if name.0 == "pad32" && param_strs.len() == 1 {
+                // special handling for pad32 function
+                return (
+                    compact::compact_pad(&name.0, &param_strs[0].0),
+                    param_strs[0].1,
+                );
+            }
+
+            // translates "require" to "assert"
+            if name.0 == "require" && param_strs.len() == 2 {
+                return (
+                    format!(
+                        "assert({})",
+                        param_strs
+                            .iter()
+                            .map(|(s, _)| s.clone())
+                            .collect::<Vec<String>>()
+                            .join(", ")
+                    ),
+                    param_strs.iter().any(|(_, b)| *b),
+                );
+            }
+
+            // "some" and "none" require typing for the paramater
+            if (name.0 == "some" || name.0 == "none") && param_strs.len() == 1 {
+                let param_name = &param_strs[0].0;
+                // finds the type of the parameter from the scope
+                let param_type = match scope.get(param_name) {
+                    Some(ty) => ty.to_string(),
+                    None => String::from("__unknown__"),
+                };
+                return (
+                    format!("{}<{}>({})", name.0, param_type, param_name),
+                    param_strs[0].1,
+                );
+            }
+
             if !param_strs.is_empty() {
-                return format!("{}({})", name, param_strs.join(", "));
+                return (
+                    format!(
+                        "{}({})",
+                        name.0,
+                        param_strs
+                            .iter()
+                            .map(|(s, _)| s.clone())
+                            .collect::<Vec<String>>()
+                            .join(", ")
+                    ),
+                    name.1,
+                );
             } else {
-                return format!("{}()", name);
+                return (format!("{}()", name.0), name.1);
             }
         }
         Expression::MemberAccess(_, expr, identifier) => {
-            let object = visit_expression(expr, formatter);
-            format!("{}.{}", object, identifier.name)
+            let (expr_object, do_not_print) = visit_expression(expr, formatter, scope);
+            if expr_object == String::from("CSL") {
+                match compact::csl_member_access(&identifier.name) {
+                    Some(access_str) => (access_str, do_not_print),
+                    None => panic!(
+                        "Unsupported CSL member access found: CSL.{}",
+                        identifier.name
+                    ),
+                }
+            } else if expr_object == String::from("witnesses") {
+                (format!("{}", identifier.name), do_not_print)
+            } else {
+                (format!("{}.{}", expr_object, identifier.name), do_not_print)
+            }
         }
-        Expression::NumberLiteral(_, number, _, _) => number.to_string(),
-        _ => String::from(""),
+        Expression::New(_, expr) => match expr.as_ref() {
+            Expression::FunctionCall(_, name, _) => {
+                if name.to_string() == WITNESSES_CONTRACT {
+                    return (String::from("no-new-keyword"), true);
+                } else {
+                    panic!("Unsupported 'new' expression found: {:#?}", expr);
+                }
+            }
+            _ => panic!("Unsupported 'new' expression found: {:#?}", expr),
+        },
+
+        Expression::NumberLiteral(_, number, _, _) => (number.to_string(), false),
+        Expression::StringLiteral(strings) => {
+            let combined_string: String = strings.iter().map(|s| s.string.clone()).collect();
+            (format!("\"{}\"", combined_string), false)
+        }
+        Expression::Type(_, ty) => match &ty {
+            solang_parser::pt::Type::Bytes(size) => (format!("bytes{}", size), true),
+            solang_parser::pt::Type::String => (String::from("Opaque<\"string\">"), true),
+            _ => panic!("Unsupported type expression found: {:#?}", ty),
+        },
+        Expression::Variable(id) => (id.name.clone(), false),
+        _ => panic!("Unsupported expression found: {:#?}", expr),
     }
 }
 

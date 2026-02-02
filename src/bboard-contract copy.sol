@@ -37,14 +37,27 @@ contract BboardContract {
         witnesses = new Witnesses();
     }
 
-    function publicKey(bytes32 sk, bytes32 sequence) pure private returns (bytes32 pk) {
-        return CSL.persistentHash([CSL.pad32("bboard:pk:"), sequence, sk]);
-    }
-
     function post(string memory newMessage) public {
         require(state == State.VACANT, "Attempted to post to an occupied board");
         owner = publicKey(witnesses.localSecretKey(), round.toBytes32());
         message = CSL.someOpString(newMessage);
         state = State.OCCUPIED;
+    }
+
+    function takeDown() public returns (string memory formerMsg) {
+        require(state == State.OCCUPIED, "Attempted to take down a vacant board");
+        require(
+            owner == publicKey(Utils.ownPublicKey(msg.sender), round.toBytes32()),
+            "Only the original poster can take down the message"
+        );
+        formerMsg = message.value;
+        state = State.VACANT;
+        message = CSL.noneOpString();
+        round.increment(1);
+        return formerMsg;
+    }
+
+    function publicKey(bytes32 sk, bytes32 sequence) pure private returns (bytes32 pk) {
+        return CSL.persistentHash([CSL.pad32("bboard:pk:"), sequence, sk]);
     }
 }

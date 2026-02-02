@@ -1,0 +1,30 @@
+// auto-generated code from Solidity source
+pragma language_version >= 0.16 && <= 0.18;
+
+witness localSecretKey(): Bytes<32>;
+
+import CompactStandardLibrary;
+
+export enum State { VACANT, OCCUPIED }
+
+export ledger state: State;
+export ledger message: Maybe<Opaque<"string">>;
+export ledger round: Counter;
+export ledger owner: Bytes<32>;
+
+constructor() {
+    state = State.VACANT;
+    round.increment(1);
+    message = none();
+}
+
+circuit publicKey(sk: Bytes<32>, sequence: Bytes<32>): Bytes<32> {
+    return persistentHash([pad(32, "bboard:pk:"), sequence, sk]);
+}
+
+export circuit post(newMessage: Opaque<"string">): [] {
+    assert(state == State.VACANT, "Attempted to post to an occupied board");
+    owner = publicKey(localSecretKey(), round.toBytes32());
+    message = some<Opaque<"string">>(newMessage);
+    state = State.OCCUPIED;
+}
