@@ -12,3 +12,13 @@ library WitnessUtils {
         return bytes32(uint256(42));
     }
 }
+
+library Compact {
+    function disclose(bytes32 data) internal pure returns (bytes32) {
+        return data;
+    }
+
+    function disclose(string memory data) internal pure returns (string memory) {
+        return data;
+    }
+}

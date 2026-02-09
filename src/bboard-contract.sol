@@ -4,7 +4,7 @@ pragma solidity ^0.8.22;
 
 import "./midnight-sol/counter-lib.sol";
 import { CompactStandardLibrary as CSL } from "./midnight-sol/CompactStandardLibrary.sol";
-import { Utils } from "./midnight-sol/Utils.sol";
+import { Utils, Compact } from "./midnight-sol/Utils.sol";
 import { WitnessUtils } from "./midnight-sol/Utils.sol";
 
 // the "Witnesses" contract is only here to simulate the presence of a witness
@@ -43,8 +43,21 @@ contract BboardContract {
 
     function post(string memory newMessage) public {
         require(state == State.VACANT, "Attempted to post to an occupied board");
-        owner = publicKey(witnesses.localSecretKey(), round.toBytes32());
-        message = CSL.someOpString(newMessage);
+        owner = publicKey(Compact.disclose(witnesses.localSecretKey()), round.toBytes32());
+        message = CSL.some(Compact.disclose(newMessage));
         state = State.OCCUPIED;
+    }
+
+    function takeDown() public returns (string memory formerMsg) {
+        require(state == State.OCCUPIED, "Attempted to take down a vacant board");
+        require(
+            owner == publicKey(Utils.ownPublicKey(msg.sender), round.toBytes32()),
+            "Only the original poster can take down the message"
+        );
+        formerMsg = message.value;
+        state = State.VACANT;
+        message = CSL.noneOpString();
+        round.increment(1);
+        return formerMsg;
     }
 }

@@ -24,7 +24,17 @@ circuit publicKey(sk: Bytes<32>, sequence: Bytes<32>): Bytes<32> {
 
 export circuit post(newMessage: Opaque<"string">): [] {
     assert(state == State.VACANT, "Attempted to post to an occupied board");
-    owner = publicKey(localSecretKey(), round.toBytes32());
-    message = some<Opaque<"string">>(newMessage);
+    owner = publicKey(disclose(localSecretKey()), round.toBytes32());
+    message = some<Opaque<"string">>(disclose(newMessage));
     state = State.OCCUPIED;
+}
+
+export circuit takeDown(): Opaque<"string"> {
+    assert(state == State.OCCUPIED, "Attempted to take down a vacant board");
+    assert(owner == publicKey(ownPublicKey(), round.toBytes32()), "Only the original poster can take down the message");
+    formerMsg = message.value;
+    state = State.VACANT;
+    message = none();
+    round.increment(1);
+    return formerMsg;
 }

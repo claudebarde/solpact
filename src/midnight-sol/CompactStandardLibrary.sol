@@ -16,11 +16,11 @@ library CompactStandardLibrary {
         return MaybeOpString({ isSome: false, value: "" });
     }
 
-    function someOpString(string memory value) internal pure returns (MaybeOpString memory) {
+    function some(string memory value) internal pure returns (MaybeOpString memory) {
         return MaybeOpString({ isSome: true, value: value });
     }
 
-    function someBytes(bytes memory value) internal pure returns (MaybeBytes memory) {
+    function some(bytes memory value) internal pure returns (MaybeBytes memory) {
         return MaybeBytes({ isSome: true, value: value });
     }
 

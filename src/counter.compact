@@ -3,7 +3,7 @@ pragma language_version >= 0.16 && <= 0.18;
 
 import CompactStandardLibrary;
 
-export ledger round: Counter;
+export ledger round: Counter;;
 
 export circuit increment(): [] {
     round.increment(1);

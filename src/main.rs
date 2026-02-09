@@ -1,4 +1,3 @@
-use core::panic;
 use serde::Deserialize;
 use solang_parser::{
     parse,
@@ -9,10 +8,32 @@ use std::{env, fs, path::Path};
 use toml;
 mod compact;
 use compact::CompactType;
+use std::io::Write;
+
+use crate::compact::sol_to_compact_type;
 
 const WITNESSES_CONTRACT: &str = "Witnesses";
 
-type Scope = HashMap<String, CompactType>;
+#[derive(Debug, Deserialize)]
+enum ValueInScope {
+    Variable(CompactType),
+    Function(FuncSignature),
+}
+
+#[derive(Debug, Deserialize)]
+
+struct Scope {
+    values: HashMap<String, ValueInScope>,
+    user_defined_types: HashMap<String, CompactType>,
+}
+impl Scope {
+    fn new() -> Self {
+        return Scope {
+            values: HashMap::new(),
+            user_defined_types: HashMap::new(),
+        };
+    }
+}
 
 #[derive(Debug, Deserialize)]
 struct SolpactConfig {
@@ -43,9 +64,14 @@ impl Formatter {
         self.indent = self.indent.saturating_sub(1);
     }
 
-    fn line(&mut self, (s, do_not_print): (String, bool)) {
+    fn reset_line(&mut self) {
         // reinitialize output line
-        self.out = String::new();
+        self.out = String::new()
+    }
+
+    fn line(&mut self, (s, do_not_print): (String, bool)) {
+        // println!("formatter line: {:#?}", s);
+        self.reset_line();
 
         if do_not_print {
             return;
@@ -56,7 +82,11 @@ impl Formatter {
         }
         self.out.push_str(&s);
         self.out.push_str(";");
-        self.out.push('\n');
+        //FIXME: doesn't print line return if it is a ledger definition
+        // there should be a better way to do it
+        if !&s.contains("ledger ") {
+            self.out.push('\n');
+        }
     }
 
     fn print(&mut self) -> String {
@@ -75,6 +105,7 @@ fn read_project_config() -> Option<SolpactConfig> {
     toml::from_str(&content).ok()
 }
 
+#[derive(Debug, Deserialize)]
 struct FuncSignature {
     name: String,
     is_exported: bool,
@@ -119,17 +150,40 @@ fn parse_func_signature(
                                     panic!("Parameter of type '{}' is missing a name!", sol_type)
                                 }
                                 Some(param_name) => {
-                                    scope.insert(
+                                    scope.values.insert(
                                         param_name.to_string(),
-                                        CompactType::from_string(&compact_type).unwrap(),
+                                        ValueInScope::Variable(compact_type.clone()),
                                     );
-                                    params.push(format!("{}: {}", param_name, compact_type))
+                                    params.push(format!(
+                                        "{}: {}",
+                                        param_name,
+                                        compact_type.to_string()
+                                    ))
                                 }
                             },
                             None => {
                                 panic!("Unsupported parameter type '{}' found!", sol_type)
                             }
-                        }
+                        };
+                        // match compact::sol_to_compact_type(&sol_type) {
+                        //     Some(compact_type) => match &param.name {
+                        //         None => {
+                        //             panic!("Parameter of type '{}' is missing a name!", sol_type)
+                        //         }
+                        //         Some(param_name) => {
+                        //             scope.insert(
+                        //                 param_name.to_string(),
+                        //                 ValueInScope::Variable(
+                        //                     CompactType::from_string(&compact_type).unwrap(),
+                        //                 ),
+                        //             );
+                        //             params.push(format!("{}: {}", param_name, compact_type))
+                        //         }
+                        //     },
+                        //     None => {
+                        //         panic!("Unsupported parameter type '{}' found!", sol_type)
+                        //     }
+                        // }
                     }
                     _ => panic!("Unsupported parameter type expression!"),
                 },
@@ -150,7 +204,7 @@ fn parse_func_signature(
                     solang_parser::pt::Expression::Type(_, ret_type) => {
                         let sol_type = ret_type.to_string();
                         match compact::sol_to_compact_type(&sol_type) {
-                            Some(compact_type) => compact_type,
+                            Some(compact_type) => compact_type.to_string(),
                             None => panic!("Unsupported return type '{}' found!", sol_type),
                         }
                     }
@@ -171,6 +225,63 @@ fn parse_func_signature(
         params,
         return_type,
     };
+}
+
+fn get_sol_type(expr_to_type: &Expression, scope: &mut Scope) -> Result<CompactType, String> {
+    match expr_to_type {
+        Expression::Variable(id) => {
+            // looks for the variable in the scope
+            match scope.values.get(&id.name) {
+                Some(ty) => match ty {
+                    ValueInScope::Variable(var) => Ok(var.clone()),
+                    ValueInScope::Function(_) => Err(format!(
+                        "Expected variable type for '{}', found function instead!",
+                        id.name
+                    )),
+                },
+                None => Err(format!("Variable '{}' not found in scope!", id.name)),
+            }
+        }
+        Expression::Type(_, sol_type) => {
+            let sol_type_str = sol_type.to_string();
+            match compact::sol_to_compact_type(&sol_type_str) {
+                Some(compact_type) => Ok(compact_type),
+                None => Err(format!("Unsupported type '{}' found!", sol_type_str)),
+            }
+        }
+        Expression::FunctionCall(_, expr, params) => match get_sol_type(expr, scope) {
+            Ok(sol_type) => Ok(sol_type),
+            Err(e) => {
+                if e == "disclose".to_string() {
+                    if params.len() != 1 {
+                        return Err(format!(
+                            "Compact.disclose expects exactly one parameter, found {}",
+                            params.len()
+                        ));
+                    }
+                    return get_sol_type(&params[0], scope);
+                } else {
+                    Err(e)
+                }
+            }
+        },
+        Expression::MemberAccess(_, expr, id) => {
+            // TODO: supports other member accesses outside of Compact.disclose
+            if expr.to_string() == "Compact" && id.name == "disclose" {
+                // FIXME: this is a hacky way to handle Compact.disclose, maybe there's a better way
+                return Err("disclose".to_string());
+            } else {
+                Err(format!(
+                    "MemberAccess '{:#?}' cannot be converted to a type",
+                    expr_to_type
+                ))
+            }
+        }
+        _ => Err(format!(
+            "Expression '{:#?}' cannot be converted to a type",
+            expr_to_type
+        )),
+    }
 }
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -272,7 +383,13 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                             compact_output.push(String::from("import CompactStandardLibrary;\n"));
                             // visit each part of the contract
                             for part in &def.parts {
-                                visit(part, top_level, &mut compact_output, &mut formatter);
+                                visit(
+                                    part,
+                                    top_level,
+                                    &mut compact_output,
+                                    &mut formatter,
+                                    &mut global_scope,
+                                );
                             }
                         }
                     }
@@ -297,7 +414,33 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         .map_err(|e| format!("Failed to write output file '{}': {e}", output_path))?;
 
     println!("Wrote Compact output to {output_path}");
-    Ok(())
+
+    // Compile the contract using the Compact compiler
+    use std::process::Command;
+
+    let output = if cfg!(target_os = "windows") {
+        Command::new("cmd")
+            .args(["/C", "echo hello"])
+            .output()
+            .expect("failed to execute process")
+    } else {
+        Command::new("sh")
+            .arg("-c")
+            .arg("compact --version")
+            .output()
+            .expect("failed to execute process")
+    };
+
+    match String::from_utf8(output.stdout) {
+        Ok(compact_version) => {
+            println!("{}", compact_version);
+            Ok(())
+        }
+        Err(_) => {
+            println!("The Compact compiler is not installed!");
+            Ok(())
+        }
+    }
 }
 
 fn visit(
@@ -305,6 +448,7 @@ fn visit(
     top_level: bool,
     compact_output: &mut Vec<String>,
     formatter: &mut Formatter,
+    scope: &mut Scope,
 ) {
     println!("Visiting contract part: {:#?}", part);
 
@@ -330,9 +474,24 @@ fn visit(
                         Expression::Variable(id) => {
                             if id.name == WITNESSES_CONTRACT {
                                 // Witness type declaration are only for Solidity compatibility
-                                String::new()
+                                CompactType::Void
                             } else {
-                                id.name.clone()
+                                match sol_to_compact_type(&id.name) {
+                                    Some(compact_type) => compact_type,
+                                    None => {
+                                        // checks if the type is not user defined
+                                        match scope.user_defined_types.get(&id.name) {
+                                            Some(ty) => ty.clone(),
+                                            None => {
+                                                // otherwise panics
+                                                panic!(
+                                                    "Unsupported variable type '{}' found!",
+                                                    id.name
+                                                )
+                                            }
+                                        }
+                                    }
+                                }
                             }
                         }
                         Expression::Type(_, sol_type) => {
@@ -358,17 +517,25 @@ fn visit(
                             _ => (),
                         }
                     }
-                    if !var_type.is_empty() {
+                    if var_type != CompactType::Void {
                         // if at top level, the variable is a ledger variable
                         if top_level {
-                            compact_output.push(format!(
-                                "{}ledger {}: {};",
-                                if is_exported { "export " } else { "" },
-                                var_name,
-                                var_type
+                            formatter.line((
+                                format!(
+                                    "{}ledger {}: {}",
+                                    if is_exported { "export " } else { "" },
+                                    var_name,
+                                    var_type.to_string()
+                                ),
+                                false,
                             ));
+                            compact_output.push(formatter.print())
                         } else {
-                            compact_output.push(format!("let {}: {};\n", var_name, var_type));
+                            formatter.line((
+                                format!("let {}: {};\n", var_name, var_type.to_string()),
+                                false,
+                            ));
+                            compact_output.push(formatter.print())
                         }
                     }
                 }
@@ -414,6 +581,11 @@ fn visit(
                         Some(variant) => variants.push(variant.name.clone()),
                     }
                 }
+                // saves enum definition in scope
+                let _ = scope.user_defined_types.insert(
+                    enum_name.to_string(),
+                    CompactType::Enum((enum_name.to_string(), variants.clone())),
+                );
                 // enum definitions are exported by default
                 compact_output.push(format!(
                     "export enum {} {{ {} }}\n",
@@ -461,6 +633,31 @@ fn visit_statement(part: &Statement, formatter: &mut Formatter, scope: &mut Scop
             }
         }
         _ => panic!("Unsupported statement found: {:#?}", part),
+    }
+}
+
+fn find_some_none_param_type(param_expr: &Expression, scope: &mut Scope) -> String {
+    println!("Handling 'some'/'none' with param: {:#?}", param_expr);
+    match param_expr {
+        Expression::Variable(id) => match scope.values.get(&id.name) {
+            Some(val_in_scope) => match val_in_scope {
+                ValueInScope::Variable(compact_type) => compact_type.to_string(),
+                _ => panic!(
+                    "Expected variable type for '{}', found function instead!",
+                    &id.name
+                ),
+            },
+            None => String::from("__unknown__"),
+        },
+        Expression::FunctionCall(_, expr, params) => {
+            if expr.to_string() == "Compact.disclose" {
+                find_some_none_param_type(&params[0], scope)
+            } else {
+                // TODO: supports other function calls
+                String::from("__unknown__")
+            }
+        }
+        _ => String::from("__unknown__"),
     }
 }
 
@@ -534,10 +731,7 @@ fn visit_expression(
             if (name.0 == "some" || name.0 == "none") && param_strs.len() == 1 {
                 let param_name = &param_strs[0].0;
                 // finds the type of the parameter from the scope
-                let param_type = match scope.get(param_name) {
-                    Some(ty) => ty.to_string(),
-                    None => String::from("__unknown__"),
-                };
+                let param_type = find_some_none_param_type(&params[0], scope);
                 return (
                     format!("{}<{}>({})", name.0, param_type, param_name),
                     param_strs[0].1,
@@ -545,6 +739,10 @@ fn visit_expression(
             }
 
             if !param_strs.is_empty() {
+                if name.0 == "ownPublicKey" {
+                    return (format!("{}()", name.0), name.1);
+                }
+
                 return (
                     format!(
                         "{}({})",
@@ -571,6 +769,16 @@ fn visit_expression(
                         identifier.name
                     ),
                 }
+            } else if expr_object == String::from("Compact") {
+                match compact::compact_member_access(&identifier.name) {
+                    Some(access_str) => (access_str, do_not_print),
+                    None => panic!(
+                        "Unsupported Compact member access found: Compact.{}",
+                        identifier.name
+                    ),
+                }
+            } else if expr_object == String::from("Utils") {
+                (format!("{}", identifier.name), do_not_print)
             } else if expr_object == String::from("witnesses") {
                 (format!("{}", identifier.name), do_not_print)
             } else {
