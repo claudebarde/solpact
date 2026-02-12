@@ -1,4 +1,4 @@
-use serde::Deserialize;
+use serde::{de::value::Error, Deserialize};
 
 pub fn sol_to_compact_type(sol_type: &str) -> Option<CompactType> {
     if let Some(bits) = sol_type.strip_prefix("uint") {
@@ -51,11 +51,33 @@ pub fn compact_member_access(member: &str) -> Option<String> {
     }
 }
 
+pub fn counter_member_access(member: &str) -> Result<String, String> {
+    match member {
+        "increment" => Ok("increment".to_string()),
+        "decrement" => Ok("decrement".to_string()),
+        "get" => Ok("get".to_string()),
+        "toBytes32" => Ok("as Bytes<32>".to_string()),
+        _ => Err(format!("Unknown counter member: {}", member)),
+    }
+}
+
 pub fn compact_pad(sol_name: &str, str_to_pad: &str) -> String {
     match sol_name {
         "pad32" => format!("pad(32, {})", str_to_pad),
         _ => panic!("Unknown pad function: {}", sol_name),
     }
+}
+
+pub fn func_to_casting(str: &str) -> bool {
+    // Solidity uses functions like toBytes32 for casting, while Compact uses as Bytes<32>
+    // this functions detects format like "<identifier> as <compact type>"
+    // and returns true if the format is correct, false otherwise
+    let parts: Vec<&str> = str.split(" as ").collect();
+    if parts.len() == 2 {
+        let compact_type_str = parts[1].trim();
+        return CompactType::from_string(compact_type_str).is_some();
+    }
+    false
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
@@ -67,7 +89,9 @@ pub enum CompactType {
     OpaqueString,
     Maybe(Box<CompactType>),
     Counter,
-    Enum((String, Vec<String>)), // (name, variants)
+    Enum((String, Vec<String>)),     // (name, variants)
+    Vector(usize, Box<CompactType>), // (length, element type)
+    Unknown,
 }
 impl CompactType {
     pub fn from_string(s: &str) -> Option<CompactType> {
@@ -99,6 +123,7 @@ impl CompactType {
                     None
                 }
             }
+            "Counter" => Some(CompactType::Counter),
             _ => None,
         }
     }
@@ -117,6 +142,20 @@ impl CompactType {
             CompactType::Enum((name, _)) => {
                 format!("{}", name)
             }
+            CompactType::Vector(length, element_type) => {
+                format!("Vector<{}, {}>", length, element_type.to_string())
+            }
+            CompactType::Unknown => "__unknown__".to_string(),
+        }
+    }
+
+    pub fn inner_type(&self) -> Option<&CompactType> {
+        if let CompactType::Maybe(inner) = self {
+            Some(inner)
+        } else if let CompactType::Vector(_, element_type) = self {
+            Some(element_type)
+        } else {
+            None
         }
     }
 }

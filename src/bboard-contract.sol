@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: MIT
-// language_version >= 0.16 && <= 0.18
+// language_version 0.20
 pragma solidity ^0.8.22;
 
 import "./midnight-sol/counter-lib.sol";
@@ -51,7 +51,7 @@ contract BboardContract {
     function takeDown() public returns (string memory formerMsg) {
         require(state == State.OCCUPIED, "Attempted to take down a vacant board");
         require(
-            owner == publicKey(Utils.ownPublicKey(msg.sender), round.toBytes32()),
+            owner == publicKey(Compact.disclose(witnesses.localSecretKey()), round.toBytes32()),
             "Only the original poster can take down the message"
         );
         formerMsg = message.value;

@@ -1,26 +1,27 @@
+use colored::Colorize;
 use serde::Deserialize;
 use solang_parser::{
     parse,
     pt::{ContractPart, Expression, SourceUnitPart, Statement},
 };
-use std::collections::HashMap;
+use std::{collections::HashMap, panic};
 use std::{env, fs, path::Path};
 use toml;
 mod compact;
 use compact::CompactType;
-use std::io::Write;
+mod build_abi;
 
 use crate::compact::sol_to_compact_type;
 
 const WITNESSES_CONTRACT: &str = "Witnesses";
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, Clone)]
 enum ValueInScope {
     Variable(CompactType),
     Function(FuncSignature),
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, Clone)]
 
 struct Scope {
     values: HashMap<String, ValueInScope>,
@@ -43,6 +44,7 @@ struct SolpactConfig {
 #[derive(Debug, Deserialize)]
 struct CompactSection {
     default_language_version: String,
+    compact_version: String,
 }
 
 struct Formatter {
@@ -105,7 +107,7 @@ fn read_project_config() -> Option<SolpactConfig> {
     toml::from_str(&content).ok()
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, Clone)]
 struct FuncSignature {
     name: String,
     is_exported: bool,
@@ -227,63 +229,6 @@ fn parse_func_signature(
     };
 }
 
-fn get_sol_type(expr_to_type: &Expression, scope: &mut Scope) -> Result<CompactType, String> {
-    match expr_to_type {
-        Expression::Variable(id) => {
-            // looks for the variable in the scope
-            match scope.values.get(&id.name) {
-                Some(ty) => match ty {
-                    ValueInScope::Variable(var) => Ok(var.clone()),
-                    ValueInScope::Function(_) => Err(format!(
-                        "Expected variable type for '{}', found function instead!",
-                        id.name
-                    )),
-                },
-                None => Err(format!("Variable '{}' not found in scope!", id.name)),
-            }
-        }
-        Expression::Type(_, sol_type) => {
-            let sol_type_str = sol_type.to_string();
-            match compact::sol_to_compact_type(&sol_type_str) {
-                Some(compact_type) => Ok(compact_type),
-                None => Err(format!("Unsupported type '{}' found!", sol_type_str)),
-            }
-        }
-        Expression::FunctionCall(_, expr, params) => match get_sol_type(expr, scope) {
-            Ok(sol_type) => Ok(sol_type),
-            Err(e) => {
-                if e == "disclose".to_string() {
-                    if params.len() != 1 {
-                        return Err(format!(
-                            "Compact.disclose expects exactly one parameter, found {}",
-                            params.len()
-                        ));
-                    }
-                    return get_sol_type(&params[0], scope);
-                } else {
-                    Err(e)
-                }
-            }
-        },
-        Expression::MemberAccess(_, expr, id) => {
-            // TODO: supports other member accesses outside of Compact.disclose
-            if expr.to_string() == "Compact" && id.name == "disclose" {
-                // FIXME: this is a hacky way to handle Compact.disclose, maybe there's a better way
-                return Err("disclose".to_string());
-            } else {
-                Err(format!(
-                    "MemberAccess '{:#?}' cannot be converted to a type",
-                    expr_to_type
-                ))
-            }
-        }
-        _ => Err(format!(
-            "Expression '{:#?}' cannot be converted to a type",
-            expr_to_type
-        )),
-    }
-}
-
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Expect: cargo run -- <input.sol> <output.compact>
     let mut args = env::args();
@@ -305,6 +250,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
     };
 
+    println!(
+        "{}",
+        format!("\nReading Solidity source from {input_path}...").blue()
+    );
     // Read Solidity source
     let source = fs::read_to_string(&input_path)
         .map_err(|e| format!("Failed to read input file '{}': {e}", input_path))?;
@@ -323,8 +272,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     };
 
     // transpiles Solidity AST to Compact code
-    let mut compact_output: Vec<String> =
-        vec![String::from("// auto-generated code from Solidity source")];
+    let mut compact_output: Vec<String> = vec![String::from(
+        "// auto-generated code from Solidity source with Solpact",
+    )];
 
     // checks if one of the comments is a Compact language version
     let mut has_language_version = false;
@@ -351,7 +301,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut formatter = Formatter::new();
 
     // visits the AST and generates Compact code
-    let mut top_level = true;
+    let top_level = true;
     let mut global_scope = Scope::new();
     for part in &ast.0 {
         match part {
@@ -413,14 +363,17 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     fs::write(&output_path, output)
         .map_err(|e| format!("Failed to write output file '{}': {e}", output_path))?;
 
-    println!("Wrote Compact output to {output_path}");
+    println!(
+        "{}",
+        format!("Wrote Compact output to {output_path}\n").green()
+    );
 
     // Compile the contract using the Compact compiler
     use std::process::Command;
 
     let output = if cfg!(target_os = "windows") {
         Command::new("cmd")
-            .args(["/C", "echo hello"])
+            .args(["/C", "compact --version"])
             .output()
             .expect("failed to execute process")
     } else {
@@ -433,7 +386,61 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     match String::from_utf8(output.stdout) {
         Ok(compact_version) => {
-            println!("{}", compact_version);
+            // compares the installed Compact version with the required version in config (if any)
+            if let Some(config) = read_project_config() {
+                let required_version = config.compact.compact_version;
+                if !compact_version.contains(&required_version) {
+                    println!(
+                        "Warning: Installed Compact version '{}' does not match the required version '{}' specified in solpact.toml!",
+                        compact_version.trim(),
+                        required_version
+                    );
+                }
+                // uses compact CLI to verify the generated Compact code
+                let output = Command::new("compact")
+                    .args(["compile", "--skip-zk"])
+                    .arg(&output_path)
+                    .arg("managed")
+                    .output();
+
+                match output {
+                    Ok(compile_output) => {
+                        let stdout = String::from_utf8_lossy(&compile_output.stdout);
+                        let stderr = String::from_utf8_lossy(&compile_output.stderr);
+
+                        if compile_output.status.success() {
+                            println!(
+                                "{}",
+                                "Compact compile on generated contract succeeded!".green()
+                            );
+                            if !stdout.trim().is_empty() {
+                                println!("stdout:\n{}", stdout);
+                            }
+                        } else {
+                            println!(
+                                "{}",
+                                format!(
+                                    "Compact compile failed (exit code: {:?}).",
+                                    compile_output.status.code()
+                                )
+                                .red()
+                            );
+                            if !stderr.trim().is_empty() {
+                                println!("{}", format!("stderr:\n{}", stderr).red());
+                            }
+                            if !stdout.trim().is_empty() {
+                                println!("stdout:\n{}", stdout);
+                            }
+                        }
+                    }
+                    Err(e) => {
+                        println!(
+                            "{}",
+                            format!("Failed to execute Compact compiler: {e}").red()
+                        );
+                    }
+                }
+            }
             Ok(())
         }
         Err(_) => {
@@ -450,7 +457,7 @@ fn visit(
     formatter: &mut Formatter,
     scope: &mut Scope,
 ) {
-    println!("Visiting contract part: {:#?}", part);
+    // println!("Visiting contract part: {:#?}", part);
 
     match part {
         ContractPart::VariableDefinition(var_def) => {
@@ -520,6 +527,12 @@ fn visit(
                     if var_type != CompactType::Void {
                         // if at top level, the variable is a ledger variable
                         if top_level {
+                            // registers the value in the scope as a ledger variable
+                            scope.values.insert(
+                                var_name.to_string(),
+                                ValueInScope::Variable(var_type.clone()),
+                            );
+                            // prints the ledger definition in Compact
                             formatter.line((
                                 format!(
                                     "{}ledger {}: {}",
@@ -542,7 +555,7 @@ fn visit(
             }
         }
         ContractPart::FunctionDefinition(func_def) => {
-            let mut scope = Scope::new();
+            let mut scope = scope.clone(); // creates a new scope for the function
             let func_signature = parse_func_signature(func_def, &mut scope);
             // function body
             let func_body: String = match &func_def.body {
@@ -636,28 +649,43 @@ fn visit_statement(part: &Statement, formatter: &mut Formatter, scope: &mut Scop
     }
 }
 
-fn find_some_none_param_type(param_expr: &Expression, scope: &mut Scope) -> String {
-    println!("Handling 'some'/'none' with param: {:#?}", param_expr);
+fn find_func_param_type(param_expr: &Expression, scope: &mut Scope) -> CompactType {
+    let default_return = CompactType::Unknown;
     match param_expr {
+        Expression::ArrayLiteral(_, vec_expr) => {
+            if vec_expr.is_empty() {
+                return default_return.clone();
+            }
+            let first_elem_type = find_func_param_type(&vec_expr[0], scope);
+            return CompactType::Vector(vec_expr.len(), Box::new(first_elem_type));
+        }
         Expression::Variable(id) => match scope.values.get(&id.name) {
             Some(val_in_scope) => match val_in_scope {
-                ValueInScope::Variable(compact_type) => compact_type.to_string(),
+                ValueInScope::Variable(compact_type) => compact_type.clone(),
                 _ => panic!(
                     "Expected variable type for '{}', found function instead!",
                     &id.name
                 ),
             },
-            None => String::from("__unknown__"),
+            None => default_return.clone(),
         },
         Expression::FunctionCall(_, expr, params) => {
             if expr.to_string() == "Compact.disclose" {
-                find_some_none_param_type(&params[0], scope)
+                find_func_param_type(&params[0], scope)
+            } else if expr.to_string() == "CSL.pad32" {
+                if params.len() != 1 {
+                    panic!(
+                        "pad function expects exactly 1 parameter, found {}",
+                        params.len()
+                    );
+                }
+                return CompactType::Bytes(32);
             } else {
                 // TODO: supports other function calls
-                String::from("__unknown__")
+                default_return.clone()
             }
         }
-        _ => String::from("__unknown__"),
+        _ => default_return.clone(),
     }
 }
 
@@ -686,8 +714,48 @@ fn visit_expression(
         }
         Expression::Assign(_, left_expr, right_expr) => {
             let left = visit_expression(left_expr, formatter, scope);
-            let right = visit_expression(right_expr, formatter, scope);
-            return (format!("{} = {}", left.0, right.0), left.1 || right.1);
+            let right = {
+                let temp_right = visit_expression(right_expr, formatter, scope);
+                // if the right expression is a function call to "none", we want to type it correctly
+                if temp_right.0 == "none<__unknown__>()" {
+                    match &**left_expr {
+                        // TODO: handle cases where none() is not assigned to a variable
+                        Expression::Variable(id) => {
+                            let var_type = match scope.values.get(&id.name) {
+                                Some(ty) => match ty {
+                                    ValueInScope::Variable(var) => var.clone(),
+                                    ValueInScope::Function(_) => panic!(
+                                        "Expected variable type for '{}', found function instead!",
+                                        id.name
+                                    ),
+                                },
+                                None => CompactType::Unknown,
+                            };
+                            // the type must be Maybe here
+                            if let CompactType::Maybe(inner_type) = var_type {
+                                (format!("none<{}>()", inner_type.to_string()), false)
+                            } else {
+                                panic!(
+                                    "Expected variable '{}' to be of type Maybe<...> for assignment to none(), found {:?} instead!",
+                                    id.name, var_type
+                                )
+                            }
+                        }
+                        _ => temp_right,
+                    }
+                } else {
+                    temp_right
+                }
+            };
+            // checks if the assignment is for a new variable or an existing variable in the scope
+            match scope.values.get(&left.0) {
+                Some(_) => {
+                    return (format!("{} = {}", left.0, right.0), left.1 || right.1);
+                }
+                None => {
+                    return (format!("const {} = {}", left.0, right.0), left.1 || right.1);
+                }
+            }
         }
         Expression::Equal(_, left_expr, right_expr) => {
             let left = visit_expression(left_expr, formatter, scope);
@@ -728,14 +796,33 @@ fn visit_expression(
             }
 
             // "some" and "none" require typing for the paramater
-            if (name.0 == "some" || name.0 == "none") && param_strs.len() == 1 {
+            if (name.0 == "some") && param_strs.len() == 1 {
                 let param_name = &param_strs[0].0;
                 // finds the type of the parameter from the scope
-                let param_type = find_some_none_param_type(&params[0], scope);
+                let param_type = find_func_param_type(&params[0], scope);
                 return (
-                    format!("{}<{}>({})", name.0, param_type, param_name),
+                    format!("{}<{}>({})", name.0, param_type.to_string(), param_name),
                     param_strs[0].1,
                 );
+            } else if name.0 == "none" {
+                // none() is typed as none<__unknown__>() since we can't know the type of the value it will hold
+                return (
+                    format!("{}<{}>()", name.0, CompactType::Unknown.to_string()),
+                    false,
+                );
+            } else if (name.0 == "persistentHash") && param_strs.len() == 1 {
+                let param_name = &param_strs[0].0;
+                // finds the type of the parameter from the scope
+                let param_type = find_func_param_type(&params[0], scope);
+                return (
+                    format!("{}<{}>({})", name.0, param_type.to_string(), param_name),
+                    param_strs[0].1,
+                );
+            }
+
+            // Solidity casting function to Compact type special handling
+            if compact::func_to_casting(&name.0) {
+                return (format!("{}", name.0), name.1);
             }
 
             if !param_strs.is_empty() {
@@ -782,7 +869,48 @@ fn visit_expression(
             } else if expr_object == String::from("witnesses") {
                 (format!("{}", identifier.name), do_not_print)
             } else {
-                (format!("{}.{}", expr_object, identifier.name), do_not_print)
+                // checks if the member access is for a variable in the scope
+                match scope.values.get(&expr_object) {
+                    Some(val_in_scope) => match val_in_scope {
+                        ValueInScope::Variable(compact_type) => {
+                            match compact_type {
+                                CompactType::Counter => {
+                                    // verifies if the member access is for a valid Counter method
+                                    match compact::counter_member_access(&identifier.name) {
+                                        Ok(access_str) => {
+                                            if identifier.name == "toBytes32" {
+                                                return (
+                                                    format!("{} {}", expr_object, access_str),
+                                                    do_not_print,
+                                                );
+                                            } else {
+                                                (
+                                                    format!("{}.{}", expr_object, access_str),
+                                                    do_not_print,
+                                                )
+                                            }
+                                        }
+                                        Err(e) => panic!(
+                                            "Unsupported member access for Counter type: {}",
+                                            e
+                                        ),
+                                    }
+                                }
+                                _ => {
+                                    return (
+                                        format!("{}.{}", expr_object, identifier.name),
+                                        do_not_print,
+                                    )
+                                }
+                            }
+                        }
+                        ValueInScope::Function(_) => panic!(
+                            "Expected variable for '{}', found function instead!",
+                            expr_object
+                        ),
+                    },
+                    None => return (format!("{}.{}", expr_object, identifier.name), do_not_print),
+                }
             }
         }
         Expression::New(_, expr) => match expr.as_ref() {
